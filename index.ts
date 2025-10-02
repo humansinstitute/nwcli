@@ -115,6 +115,9 @@ async function showMenu(wallet: WalletConnect, support: WalletSupport) {
   if (supportsMethod(support, "lookup_invoice")) items.push({ key: "lookup_invoice", label: "Lookup invoice" });
   if (supportsMethod(support, "pay_lnaddress")) items.push({ key: "pay_lnaddress", label: "Pay LN Address" });
 
+  // Always offer client-side LN Address payment via LNURLp
+  items.push({ key: "pay_lnaddress_client", label: "Pay LN Address (client)" });
+
   items.push({ key: "switch_wallet", label: "Switch wallet" });
   items.push({ key: "quit", label: "Quit" });
 
@@ -216,6 +219,71 @@ async function showMenu(wallet: WalletConnect, support: WalletSupport) {
           const amount = await promptNumber("Amount (sats):");
           const result = await withTimeout((wallet as any).payLnAddress(lnaddr.trim(), amount * 1000), 30000, "pay_lnaddress");
           println(JSON.stringify(result, null, 2));
+          break;
+        }
+        case "pay_lnaddress_client": {
+          const { parseLightningAddress, fetchLnurlpParams, requestInvoice, verifyInvoiceAmount, verifyInvoiceDescriptionHashIfAvailable } = await import("./utils/lnurl.ts");
+          const lnaddr = await prompt("LN Address (name@domain):");
+          if (!lnaddr) { println("No LN address provided."); break; }
+
+          const url = parseLightningAddress(lnaddr.trim());
+          if (!url) { println("Invalid LN address."); break; }
+          const domain = url.hostname;
+
+          // 1) Fetch LNURLp params
+          const params = await withTimeout(fetchLnurlpParams(url), 20000, "lnurlp_fetch");
+          if (params.tag !== "payRequest") { println("Not a payRequest LNURL."); break; }
+
+          // Show basic info
+          println(`LNURL domain: ${domain}`);
+          try {
+            const metadata = JSON.parse(params.metadata);
+            const textEntry = Array.isArray(metadata) ? metadata.find((e: any) => Array.isArray(e) && e[0] === "text/plain") : undefined;
+            if (textEntry?.[1]) println(`Description: ${textEntry[1]}`);
+          } catch {}
+
+          // 2) Prompt amount within bounds
+          const minSats = Math.ceil(params.minSendable / 1000);
+          const maxSats = Math.floor(params.maxSendable / 1000);
+          println(`Amount range: ${minSats} - ${maxSats} sats`);
+          let sats = await promptNumber("Amount (sats):");
+          if (sats < minSats || sats > maxSats) {
+            println("Amount out of bounds.");
+            break;
+          }
+
+          // 3) Optional comment
+          let comment: string | undefined = undefined;
+          if ((params.commentAllowed || 0) > 0) {
+            const c = await prompt(`Comment (up to ${params.commentAllowed} chars, optional):`);
+            comment = (c || "").slice(0, params.commentAllowed);
+          }
+
+          // 4) Request invoice from callback
+          const msats = sats * 1000;
+          const cbResp = await withTimeout(requestInvoice(params.callback, msats, { comment }), 20000, "lnurlp_callback");
+          const pr = cbResp.pr;
+
+          // 5) Verify invoice amount and description hash (best-effort)
+          verifyInvoiceAmount(pr, msats);
+          verifyInvoiceDescriptionHashIfAvailable(pr, params.metadata);
+
+          // 6) Pay invoice
+          const payRes: PayInvoiceResult = await withTimeout(wallet.payInvoice(pr), 30000, "pay_invoice");
+          println("Payment submitted:");
+          println(JSON.stringify(payRes, null, 2));
+
+          // 7) Handle successAction
+          if (cbResp.successAction) {
+            const sa = cbResp.successAction;
+            if (sa.tag === "message" && sa.message) {
+              println(`Success message: ${sa.message}`);
+            } else if (sa.tag === "url" && sa.url) {
+              println(`Success URL: ${sa.url}${sa.description ? ` - ${sa.description}` : ""}`);
+            } else if (sa.tag === "aes") {
+              println("Success AES payload received (decryption not implemented in CLI).");
+            }
+          }
           break;
         }
         default:
