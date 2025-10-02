@@ -1,0 +1,25 @@
+{
+  "name": "nwcli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun index.ts",
+    "dev": "bun --hot index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.4.0",
+    "applesauce-core": "*",
+    "applesauce-relay": "*",
+    "applesauce-wallet-connect": "*",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^5.5.0"
+  }
+}
