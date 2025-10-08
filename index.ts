@@ -16,14 +16,22 @@ import { getRelayPool, closeRelayPool } from "./utils/nostr";
 import { withTimeout } from "./utils/async";
 import { firstValueFrom, filter, timeout as rxTimeout, take } from "rxjs";
 
-type NwcStore = Record<string, string>; // nickname -> uri
+type NwcEntry = { uri: string; npub?: string };
+type NwcStore = Record<string, NwcEntry>; // nickname -> { uri, npub? }
 
 const NWC_PATH = join(process.cwd(), "nwc.json");
 
 function loadNwcStore(): NwcStore {
   try {
-    const data = readJsonFile<NwcStore>(NWC_PATH);
-    return data && typeof data === "object" ? data : {};
+    const raw = readJsonFile<any>(NWC_PATH);
+    if (!raw || typeof raw !== "object") return {};
+    // Backwards compatibility: previous format was Record<string, string>
+    const fixed: NwcStore = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "string") fixed[k] = { uri: v };
+      else if (v && typeof v === "object" && typeof (v as any).uri === "string") fixed[k] = { uri: (v as any).uri, npub: (v as any).npub };
+    }
+    return fixed;
   } catch {
     return {};
   }
@@ -33,7 +41,7 @@ function saveNwcStore(store: NwcStore) {
   writeJsonFile(NWC_PATH, store);
 }
 
-async function chooseOrCreateNwc(store: NwcStore): Promise<{ nickname: string; uri: string }> {
+async function chooseOrCreateNwc(store: NwcStore): Promise<{ nickname: string; uri: string; npub?: string }> {
   const names = Object.keys(store);
   if (names.length === 0) {
     println("No NWC entries found. Let's add one.");
@@ -41,17 +49,23 @@ async function chooseOrCreateNwc(store: NwcStore): Promise<{ nickname: string; u
   }
 
   const choice = await promptSelect("Select a saved NWC or add new:", [
-    ...names.map((n) => ({ label: `${n} -> ${store[n]}`, value: n })),
+    ...names.map((n) => {
+      const entry = store[n];
+      const shortNpub = entry.npub ? entry.npub.slice(0, 8) : undefined;
+      const npubStr = shortNpub ? ` | npub: ${shortNpub}` : "";
+      return { label: `${n}${npubStr}`, value: n };
+    }),
     { label: "+ Add new", value: "__new" },
   ]);
 
   if (choice === "__new") {
     return await createNwcEntry(store);
   }
-  return { nickname: choice, uri: store[choice] };
+  const entry = store[choice];
+  return { nickname: choice, uri: entry.uri, npub: entry.npub };
 }
 
-async function createNwcEntry(store: NwcStore): Promise<{ nickname: string; uri: string }> {
+async function createNwcEntry(store: NwcStore): Promise<{ nickname: string; uri: string; npub?: string }> {
   // Ask for nickname and connection string
   let nickname = "";
   while (!nickname) {
@@ -78,10 +92,13 @@ async function createNwcEntry(store: NwcStore): Promise<{ nickname: string; uri:
     }
   }
 
-  store[nickname] = uri;
+  // Optional Nostr npub association
+  const npub = (await prompt("Optional Nostr npub (press Enter to skip):"))?.trim();
+
+  store[nickname] = { uri, npub: npub ? npub : undefined };
   saveNwcStore(store);
   println(`Saved NWC entry '${nickname}'.`);
-  return { nickname, uri };
+  return { nickname, uri, npub: npub ? npub : undefined };
 }
 
 function createWallet(uri: string): WalletConnect {
@@ -299,6 +316,8 @@ async function showMenu(wallet: WalletConnect, support: WalletSupport) {
 
 async function main() {
   println("Nostr Wallet Connect CLI");
+  const apiPort = process.env.PORT ? Number(process.env.PORT) : 8787;
+  println(`API base (if running): http://localhost:${apiPort}`);
   const store = loadNwcStore();
   onExit(() => closeRelayPool());
 
