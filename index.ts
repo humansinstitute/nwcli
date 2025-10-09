@@ -315,6 +315,16 @@ async function showMenu(wallet: WalletConnect, support: WalletSupport) {
 }
 
 async function main() {
+  // Optionally auto-start the HTTP API when running the CLI.
+  // Set START_API=0 to disable.
+  try {
+    if (process.env.START_API !== "0") {
+      await import("./api.ts");
+    }
+  } catch (e) {
+    // Non-fatal: continue running CLI even if API fails to start
+  }
+
   println("Nostr Wallet Connect CLI");
   const apiPort = process.env.PORT ? Number(process.env.PORT) : 8787;
   println(`API base (if running): http://localhost:${apiPort}`);
