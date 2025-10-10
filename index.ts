@@ -36,6 +36,13 @@ import { parseBolt11 } from "applesauce-core/helpers";
 const MSATS_PER_SAT = 1000;
 const PAY_TIMEOUT_MS = Number(process.env.PAY_TIMEOUT_MS || "60000");
 
+function persistEntry(store: NwcStore, nickname: string, entry: NwcEntry): NwcStore {
+  const next = loadNwcStore();
+  next[nickname] = entry;
+  saveNwcStore(next);
+  return next;
+}
+
 function msatsToSats(msats: number | undefined | null): number {
   if (!msats || !Number.isFinite(msats)) return 0;
   return Math.floor(msats / MSATS_PER_SAT);
@@ -66,33 +73,24 @@ async function payLnAddressViaClientFlow(
   entry: NwcEntry,
   nickname: string,
   activeSubAccountId: string | null
-): Promise<void> {
-  const {
-    parseLightningAddress,
-    fetchLnurlpParams,
-    requestInvoice,
-    verifyInvoiceAmount,
-    verifyInvoiceDescriptionHashIfAvailable,
-  } = await import("./utils/lnurl");
+): Promise<NwcStore> {
+  const { resolveLightningAddress, executeLnurlPayment } = await import("./utils/lnurl");
 
   const lnaddr = await prompt("LN Address (name@domain):");
   if (!lnaddr) {
     println("No LN address provided.");
-    return;
+    return store;
   }
 
-  const url = parseLightningAddress(lnaddr.trim());
-  if (!url) {
-    println("Invalid LN address.");
-    return;
+  let resolved;
+  try {
+    resolved = await withTimeout(resolveLightningAddress(lnaddr.trim()), 20000, "lnurlp_fetch");
+  } catch (error: any) {
+    println(`Failed to resolve LN address: ${error?.message || String(error)}`);
+    return store;
   }
 
-  const domain = url.hostname;
-  const params = await withTimeout(fetchLnurlpParams(url), 20000, "lnurlp_fetch");
-  if (params.tag !== "payRequest") {
-    println("Not a payRequest LNURL.");
-    return;
-  }
+  const { domain, params } = resolved;
 
   println(`LNURL domain: ${domain}`);
   try {
@@ -109,7 +107,7 @@ async function payLnAddressViaClientFlow(
   const sats = await promptNumber("Amount (sats):");
   if (sats < minSats || sats > maxSats) {
     println("Amount out of bounds.");
-    return;
+    return store;
   }
 
   let comment: string | undefined;
@@ -121,35 +119,32 @@ async function payLnAddressViaClientFlow(
   const msats = sats * MSATS_PER_SAT;
   if (activeSubAccountId) {
     const sub = requireSubAccount(entry, nickname, activeSubAccountId);
-    if (!sub) return;
+    if (!sub) return store;
     if (!hasSufficientBalance(entry, activeSubAccountId, msats)) {
       println(
         `Insufficient balance. ${sub.label} has ${formatMsats(sub.balanceMsats)}, requires ${formatMsats(msats)}.`
       );
-      return;
+      return store;
     }
   }
 
-  const cbResp = await withTimeout(
-    requestInvoice(params.callback, msats, { comment }),
-    20000,
-    "lnurlp_callback"
-  );
-  const pr = cbResp.pr;
+  let outcome;
+  try {
+    outcome = await withTimeout(
+      executeLnurlPayment({ wallet, resolved, amountMsats: msats, comment }),
+      PAY_TIMEOUT_MS,
+      "pay_invoice"
+    );
+  } catch (error: any) {
+    println(`Failed to pay LN address: ${error?.message || String(error)}`);
+    return store;
+  }
 
-  verifyInvoiceAmount(pr, msats);
-  verifyInvoiceDescriptionHashIfAvailable(pr, params.metadata);
-
-  const payRes: PayInvoiceResult = await withTimeout(
-    wallet.payInvoice(pr),
-    PAY_TIMEOUT_MS,
-    "pay_invoice"
-  );
   println("Payment submitted:");
-  println(JSON.stringify(payRes, null, 2));
+  println(JSON.stringify(outcome.payResult, null, 2));
 
-  if (cbResp.successAction) {
-    const sa = cbResp.successAction;
+  if (outcome.successAction) {
+    const sa = outcome.successAction;
     if (sa.tag === "message" && sa.message) {
       println(`Success message: ${sa.message}`);
     } else if (sa.tag === "url" && sa.url) {
@@ -161,18 +156,20 @@ async function payLnAddressViaClientFlow(
 
   if (activeSubAccountId) {
     try {
-      debitSubAccount(entry, activeSubAccountId, msats);
-      recordSubAccountUsage(store, nickname, activeSubAccountId, { immediateSave: false });
-      saveNwcStore(store);
+      debitSubAccount(entry, activeSubAccountId, outcome.amountMsats);
+      store = recordSubAccountUsage(store, nickname, activeSubAccountId, { immediateSave: false });
+      store = persistEntry(store, nickname, entry);
       println(
-        `[ledger] Debited ${formatMsats(msats)} from ${describeContext(entry, nickname, activeSubAccountId)}.`
+        `[ledger] Debited ${formatMsats(outcome.amountMsats)} from ${describeContext(entry, nickname, activeSubAccountId)}.`
       );
     } catch (err: any) {
       println(`[ledger] Failed to debit sub-account: ${err?.message || String(err)}`);
     }
   } else {
-    recordSubAccountUsage(store, nickname, activeSubAccountId);
+    store = recordSubAccountUsage(store, nickname, activeSubAccountId);
   }
+
+  return store;
 }
 
 function requireSubAccount(entry: NwcEntry, nickname: string, subId: string | null): NwcSubAccount | null {
@@ -249,7 +246,8 @@ async function createNwcEntry(store: NwcStore): Promise<{ nickname: string; entr
 }
 
 async function manageSubAccounts(store: NwcStore, nickname: string): Promise<string | null> {
-  const entry = store[nickname];
+  let currentStore = store;
+  let entry = currentStore[nickname];
   if (!entry) {
     println(`Wallet '${nickname}' not found.`);
     return null;
@@ -258,6 +256,14 @@ async function manageSubAccounts(store: NwcStore, nickname: string): Promise<str
   ensureSubAccountContainer(entry);
 
   while (true) {
+    currentStore = loadNwcStore();
+    entry = currentStore[nickname];
+    if (!entry) {
+      println(`Wallet '${nickname}' not found.`);
+      return null;
+    }
+    ensureSubAccountContainer(entry);
+
     const subAccounts = entry.subAccounts || {};
     const subKeys = Object.keys(subAccounts);
     println("");
@@ -283,21 +289,24 @@ async function manageSubAccounts(store: NwcStore, nickname: string): Promise<str
 
     if (selection === "__back") return null;
     if (selection === "__create") {
-      await createSubAccount(store, nickname);
+      const nextStore = await createSubAccount(currentStore, nickname);
+      if (nextStore) currentStore = nextStore;
       continue;
     }
-    const result = await showSubAccountDetails(store, nickname, selection);
+    const result = await showSubAccountDetails(currentStore, nickname, selection);
     if (result === "use") {
       return selection;
+    } else if (result) {
+      currentStore = result;
     }
   }
 }
 
-async function createSubAccount(store: NwcStore, nickname: string): Promise<void> {
+async function createSubAccount(store: NwcStore, nickname: string): Promise<NwcStore | null> {
   const entry = store[nickname];
   if (!entry) {
     println(`Wallet '${nickname}' not found.`);
-    return;
+    return null;
   }
 
   ensureSubAccountContainer(entry);
@@ -309,6 +318,16 @@ async function createSubAccount(store: NwcStore, nickname: string): Promise<void
   }
 
   const description = (await prompt("Description (optional):"))?.trim();
+  let connectUri: string | undefined;
+  const rawConnect = (await prompt("Connect URI for this sub-account (optional):"))?.trim();
+  if (rawConnect) {
+    try {
+      parseWalletConnectURI(rawConnect);
+      connectUri = rawConnect;
+    } catch (error: any) {
+      println(`Connect URI ignored (invalid): ${error?.message || String(error)}`);
+    }
+  }
   const id = generateSubAccountId(store, nickname);
   const now = new Date().toISOString();
   entry.subAccounts![id] = {
@@ -318,26 +337,37 @@ async function createSubAccount(store: NwcStore, nickname: string): Promise<void
     createdAt: now,
     updatedAt: now,
     usageCount: 0,
+    connectUri,
     balanceMsats: 0,
     pendingMsats: 0,
     invoices: {},
   } satisfies NwcSubAccount;
 
-  saveNwcStore(store);
+  const next = persistEntry(store, nickname, entry);
   const identifier = formatSubAccountIdentifier(nickname, id);
   println(`Created sub-account '${label}'. Identifier: ${identifier}`);
   println("Use this identifier with the CLI or API to act on behalf of the sub-account. Operations still route through the parent wallet.");
+  return next;
 }
 
-async function showSubAccountDetails(store: NwcStore, nickname: string, subId: string): Promise<"use" | void> {
-  const entry = store[nickname];
-  const sub = entry?.subAccounts?.[subId];
+async function showSubAccountDetails(store: NwcStore, nickname: string, subId: string): Promise<"use" | NwcStore> {
+  let currentStore = store;
+  let entry = currentStore[nickname];
+  let sub = entry?.subAccounts?.[subId];
   if (!entry || !sub) {
     println("Sub-account not found.");
-    return;
+    return currentStore;
   }
 
   while (true) {
+    currentStore = loadNwcStore();
+    entry = currentStore[nickname];
+    sub = entry?.subAccounts?.[subId];
+    if (!entry || !sub) {
+      println("Sub-account not found.");
+      return currentStore;
+    }
+    ensureSubAccountContainer(entry);
     println("");
     println(`Sub-account: ${sub.label}`);
     println(`Identifier: ${formatSubAccountIdentifier(nickname, subId)}`);
@@ -355,13 +385,15 @@ async function showSubAccountDetails(store: NwcStore, nickname: string, subId: s
     const choice = await promptSelect("Select action:", [
       { label: "Rename", value: "rename" },
       { label: "Update description", value: "description" },
+      { label: "Show connect URI", value: "show_uri" },
+      { label: "Set connect URI", value: "set_uri" },
       { label: "View invoices", value: "invoices" },
       { label: "Use for session", value: "use" },
       { label: "Remove sub-account", value: "delete" },
       { label: "Back", value: "__back" },
     ]);
 
-    if (choice === "__back") return;
+    if (choice === "__back") return currentStore;
 
     if (choice === "use") {
       return "use";
@@ -391,7 +423,7 @@ async function showSubAccountDetails(store: NwcStore, nickname: string, subId: s
       } else {
         sub.label = newLabel;
         sub.updatedAt = new Date().toISOString();
-        saveNwcStore(store);
+        currentStore = persistEntry(currentStore, nickname, entry);
         println("Label updated.");
       }
       continue;
@@ -401,8 +433,36 @@ async function showSubAccountDetails(store: NwcStore, nickname: string, subId: s
       const newDesc = (await prompt("New description (leave blank to clear):"))?.trim();
       sub.description = newDesc ? newDesc : undefined;
       sub.updatedAt = new Date().toISOString();
-      saveNwcStore(store);
+      currentStore = persistEntry(currentStore, nickname, entry);
       println("Description updated.");
+      continue;
+    }
+
+    if (choice === "show_uri") {
+      if (sub.connectUri) {
+        println(`Stored connect URI:\n${sub.connectUri}`);
+      } else {
+        println("No connect URI stored for this sub-account.");
+      }
+      continue;
+    }
+
+    if (choice === "set_uri") {
+      const raw = (await prompt("Paste NWC connect URI (leave blank to clear):"))?.trim();
+      try {
+        if (!raw) {
+          sub.connectUri = undefined;
+          println("Connect URI cleared.");
+        } else {
+          parseWalletConnectURI(raw);
+          sub.connectUri = raw;
+          println("Connect URI updated.");
+        }
+        sub.updatedAt = new Date().toISOString();
+        saveNwcStore(store);
+      } catch (error: any) {
+        println(`Invalid connect URI: ${error?.message || String(error)}`);
+      }
       continue;
     }
 
@@ -415,9 +475,9 @@ async function showSubAccountDetails(store: NwcStore, nickname: string, subId: s
       if (entry.subAccounts && subId in entry.subAccounts) {
         delete entry.subAccounts[subId];
       }
-      saveNwcStore(store);
+      currentStore = persistEntry(currentStore, nickname, entry);
       println("Sub-account removed.");
-      return;
+      return currentStore;
     }
   }
 }
@@ -431,14 +491,20 @@ function describeContext(entry: NwcEntry | undefined, nickname: string, subId: s
   return `${sub.label} (${formatSubAccountIdentifier(nickname, subId)}) | balance: ${balance}${pending}`;
 }
 
-function recordSubAccountUsage(store: NwcStore, nickname: string, subId: string | null, options: { immediateSave?: boolean } = {}): void {
-  if (!subId) return;
+function recordSubAccountUsage(
+  store: NwcStore,
+  nickname: string,
+  subId: string | null,
+  options: { immediateSave?: boolean } = {}
+): NwcStore {
+  if (!subId) return store;
   const entry = store[nickname];
-  if (!entry) return;
+  if (!entry) return store;
   const touched = touchSubAccount(entry, subId);
   if (touched && options.immediateSave !== false) {
-    saveNwcStore(store);
+    store = persistEntry(store, nickname, entry);
   }
+  return store;
 }
 
 async function selectSessionContext(store: NwcStore, nickname: string, currentSubId: string | null): Promise<string | null | undefined> {
@@ -533,6 +599,7 @@ interface ShowMenuContext {
 }
 
 async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
+  let currentStore = store;
   let activeSubAccountId: string | null = null;
 
   // Notifications listener (prints async events)
@@ -543,7 +610,8 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
         if (n?.notification_type === "payment_received") {
           const tx = n.notification as Transaction;
           println(`[notification] payment_received: ${tx.amount ? formatMsats(tx.amount) : ""}`);
-          const ledgerMsg = handleIncomingPaymentNotification(store, nickname, tx);
+          currentStore = loadNwcStore();
+          const ledgerMsg = handleIncomingPaymentNotification(currentStore, nickname, tx);
           if (ledgerMsg) println(ledgerMsg);
         }
       } catch {}
@@ -551,7 +619,8 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
   }
 
   while (true) {
-    const entry = store[nickname];
+    currentStore = loadNwcStore();
+    const entry = currentStore[nickname];
     if (!entry) {
       println("Wallet entry not found. Returning to wallet list.");
       notifSub?.unsubscribe?.();
@@ -577,6 +646,7 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
       menuItems.push({ value: "pay_lnaddress", label: "Pay LN Address" });
     }
     menuItems.push({ value: "pay_lnaddress_client", label: "Pay LN Address (client)" });
+    menuItems.push({ value: "show_connect_uri", label: "Show connect URI" });
 
     const hasSubAccounts = Object.keys(entry.subAccounts || {}).length > 0;
     if (hasSubAccounts) {
@@ -604,7 +674,7 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
     try {
       switch (selection) {
         case "switch_context": {
-          const next = await selectSessionContext(store, nickname, activeSubAccountId);
+          const next = await selectSessionContext(currentStore, nickname, activeSubAccountId);
           if (next !== undefined) {
             activeSubAccountId = next;
             const updatedLabel = describeContext(entry, nickname, activeSubAccountId);
@@ -613,7 +683,7 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
           break;
         }
         case "manage_subaccounts": {
-          const chosen = await manageSubAccounts(store, nickname);
+          const chosen = await manageSubAccounts(currentStore, nickname);
           if (typeof chosen === "string") {
             activeSubAccountId = chosen;
             const updatedLabel = describeContext(entry, nickname, activeSubAccountId);
@@ -632,7 +702,7 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
             println(`Balance for ${describeContext(entry, nickname, activeSubAccountId)}.`);
             println(`  Available: ${formatMsats(sub.balanceMsats)}`);
             println(`  Pending: ${formatMsats(sub.pendingMsats)}`);
-            recordSubAccountUsage(store, nickname, activeSubAccountId);
+            currentStore = recordSubAccountUsage(currentStore, nickname, activeSubAccountId);
           } else {
             const res: GetBalanceResult = await withTimeout(wallet.getBalance(), 15000, "get_balance");
             println(`Balance for ${describeContext(entry, nickname, activeSubAccountId)}: ${formatMsats(res.balance)}`);
@@ -657,14 +727,14 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
                 paymentHash: result.payment_hash,
                 amountMsats: result.amount ?? amount * MSATS_PER_SAT,
               });
-              recordSubAccountUsage(store, nickname, activeSubAccountId, { immediateSave: false });
-              saveNwcStore(store);
+              currentStore = recordSubAccountUsage(currentStore, nickname, activeSubAccountId, { immediateSave: false });
+              currentStore = persistEntry(currentStore, nickname, entry);
               println(`[ledger] Pending balance for ${describeContext(entry, nickname, activeSubAccountId)} increased by ${formatMsats(ledgerInvoice.amountMsats)}.`);
             } catch (err: any) {
               println(`[ledger] Failed to register invoice: ${err?.message || String(err)}`);
             }
           } else {
-            recordSubAccountUsage(store, nickname, activeSubAccountId);
+            currentStore = recordSubAccountUsage(currentStore, nickname, activeSubAccountId);
           }
           if (support.notifications?.includes("payment_received")) {
             println("Waiting for payment notification (Ctrl+C to stop)...");
@@ -702,14 +772,14 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
           if (activeSubAccountId) {
             try {
               debitSubAccount(entry, activeSubAccountId, amountMsats);
-              recordSubAccountUsage(store, nickname, activeSubAccountId, { immediateSave: false });
-              saveNwcStore(store);
+              currentStore = recordSubAccountUsage(currentStore, nickname, activeSubAccountId, { immediateSave: false });
+              currentStore = persistEntry(currentStore, nickname, entry);
               println(`[ledger] Debited ${formatMsats(amountMsats)} from ${describeContext(entry, nickname, activeSubAccountId)}.`);
             } catch (err: any) {
               println(`[ledger] Failed to debit sub-account: ${err?.message || String(err)}`);
             }
           } else {
-            recordSubAccountUsage(store, nickname, activeSubAccountId);
+            currentStore = recordSubAccountUsage(currentStore, nickname, activeSubAccountId);
           }
           break;
         }
@@ -723,7 +793,7 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
               println(`${i + 1}) ${t.type} ${Math.floor(t.amount / 1000)} sats | ${t.state} | ${t.description || ""}`);
             });
           }
-          recordSubAccountUsage(store, nickname, activeSubAccountId);
+          currentStore = recordSubAccountUsage(currentStore, nickname, activeSubAccountId);
           break;
         }
         case "lookup_invoice": {
@@ -738,12 +808,12 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
           }
           const result = await withTimeout((wallet as any).lookupInvoice(invoice.trim()), 15000, "lookup_invoice");
           println(JSON.stringify(result, null, 2));
-          recordSubAccountUsage(store, nickname, activeSubAccountId);
+          currentStore = recordSubAccountUsage(currentStore, nickname, activeSubAccountId);
           break;
         }
         case "pay_lnaddress": {
           if (activeSubAccountId) {
-            await payLnAddressViaClientFlow(wallet, store, entry, nickname, activeSubAccountId);
+            await payLnAddressViaClientFlow(wallet, currentStore, entry, nickname, activeSubAccountId);
             break;
           }
 
@@ -766,11 +836,25 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
             "pay_lnaddress"
           );
           println(JSON.stringify(result, null, 2));
-          recordSubAccountUsage(store, nickname, activeSubAccountId);
+          currentStore = recordSubAccountUsage(currentStore, nickname, activeSubAccountId);
           break;
         }
         case "pay_lnaddress_client": {
-          await payLnAddressViaClientFlow(wallet, store, entry, nickname, activeSubAccountId);
+          currentStore = await payLnAddressViaClientFlow(wallet, currentStore, entry, nickname, activeSubAccountId);
+          break;
+        }
+        case "show_connect_uri": {
+          if (activeSubAccountId) {
+            const sub = requireSubAccount(entry, nickname, activeSubAccountId);
+            if (!sub) break;
+            if (sub.connectUri) {
+              println(`Sub-account connect URI:\n${sub.connectUri}`);
+            } else {
+              println("No connect URI stored for this sub-account. Use sub-account management to set one.");
+            }
+          } else {
+            println(`Wallet connect URI:\n${entry.uri}`);
+          }
           break;
         }
         default:
@@ -798,10 +882,11 @@ async function main() {
   println("Nostr Wallet Connect CLI");
   const apiPort = process.env.PORT ? Number(process.env.PORT) : 8787;
   println(`API base (if running): http://localhost:${apiPort}`);
-  const store = loadNwcStore();
+  let store = loadNwcStore();
   onExit(() => closeRelayPool());
 
   while (true) {
+    store = loadNwcStore();
     const { nickname, entry } = await chooseOrCreateNwc(store);
     println(`Connecting to wallet '${nickname}'...`);
     let wallet: WalletConnect | null = null;

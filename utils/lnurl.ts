@@ -1,6 +1,8 @@
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
 import { parseBolt11 } from "applesauce-core/helpers";
+import type { WalletConnect } from "applesauce-wallet-connect";
+import type { PayInvoiceResult } from "applesauce-wallet-connect/helpers";
 
 export type LnurlPayParams = {
   callback: string;
@@ -73,3 +75,68 @@ export function verifyInvoiceDescriptionHashIfAvailable(pr: string, metadataStri
   }
 }
 
+export interface ResolvedLightningAddress {
+  lnAddress: string;
+  url: URL;
+  params: LnurlPayParams;
+  domain: string;
+}
+
+export async function resolveLightningAddress(lnAddress: string): Promise<ResolvedLightningAddress> {
+  const trimmed = lnAddress.trim();
+  const url = parseLightningAddress(trimmed);
+  if (!url) throw new Error("Invalid LN address format");
+  const params = await fetchLnurlpParams(url);
+  return { lnAddress: trimmed, url, params, domain: url.hostname };
+}
+
+export interface LnAddressPaymentResult {
+  lnAddress: string;
+  invoice: string;
+  amountMsats: number;
+  payResult: PayInvoiceResult;
+  successAction?: any | null;
+  metadata: string;
+  domain: string;
+  params: LnurlPayParams;
+}
+
+export async function executeLnurlPayment(options: {
+  wallet: WalletConnect;
+  resolved: ResolvedLightningAddress;
+  amountMsats: number;
+  comment?: string;
+}): Promise<LnAddressPaymentResult> {
+  const { wallet, resolved, amountMsats, comment } = options;
+  const { params, url, lnAddress, domain } = resolved;
+
+  if (amountMsats <= 0) throw new Error("Amount must be positive");
+  if (amountMsats < params.minSendable || amountMsats > params.maxSendable) {
+    throw new Error("Amount outside allowed range for LN address");
+  }
+  if (comment && (params.commentAllowed || 0) === 0) {
+    throw new Error("Comments not supported by this LN address");
+  }
+  if (comment && params.commentAllowed && comment.length > params.commentAllowed) {
+    throw new Error(`Comment exceeds allowed length of ${params.commentAllowed}`);
+  }
+
+  const callbackResponse = await requestInvoice(params.callback, amountMsats, {
+    comment: comment ? comment.slice(0, params.commentAllowed ?? comment.length) : undefined,
+  });
+  const invoice = callbackResponse.pr;
+  verifyInvoiceAmount(invoice, amountMsats);
+  verifyInvoiceDescriptionHashIfAvailable(invoice, params.metadata);
+
+  const payResult = await wallet.payInvoice(invoice);
+  return {
+    lnAddress,
+    invoice,
+    amountMsats,
+    payResult,
+    successAction: callbackResponse.successAction ?? null,
+    metadata: params.metadata,
+    domain,
+    params,
+  };
+}
