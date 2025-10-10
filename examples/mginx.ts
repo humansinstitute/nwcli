@@ -1,423 +1,211 @@
-import { onlyEvents, RelayPool } from "applesauce-relay";
-import { SimpleSigner } from "applesauce-signers";
-import {
-  createWalletConnectURI,
-  WALLET_REQUEST_KIND,
-  type Transaction,
-} from "applesauce-wallet-connect/helpers";
+import { RelayPool } from "applesauce-relay";
+import { createWalletConnectURI } from "applesauce-wallet-connect/helpers";
 import { WalletConnect } from "applesauce-wallet-connect/wallet-connect";
-import { WalletService } from "applesauce-wallet-connect/wallet-service";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { share, tap } from "rxjs";
 
-// Configuration interface
+import {
+  getSubAccountSecrets,
+  getSubAccounts,
+  initStorage,
+} from "../utils/storage";
+import {
+  WalletServiceManager,
+  type CreateSubAccountResult,
+} from "../src/wallet-service-manager";
+
 interface Config {
   relay?: string | string[];
   "connect-uri"?: string;
   data?: string;
 }
 
-// Load configuration from config.json if it exists
-let config: Config = {};
-const configPath = "config.json";
-if (existsSync(configPath)) {
-  try {
-    const configData = readFileSync(configPath, "utf-8");
-    config = JSON.parse(configData);
-    console.log(`Loaded configuration from ${configPath}`);
-  } catch (error) {
-    console.error(`Error loading config file: ${error}`);
-    process.exit(1);
+interface CliValues {
+  relay?: string[];
+  "connect-uri"?: string;
+  data?: string;
+  config?: string;
+  create?: string;
+  description?: string;
+  "client-secret"?: string;
+  "service-secret"?: string;
+  list?: boolean;
+}
+
+function loadConfig(path: string): Config {
+  const raw = readFileSync(path, "utf-8");
+  return JSON.parse(raw) as Config;
+}
+
+function coerceRelays(value?: string | string[]): string[] | undefined {
+  if (!value) return undefined;
+  if (Array.isArray(value)) return value;
+  return [value];
+}
+
+function printUsage(): void {
+  console.error("Usage: bun run examples/mginx.ts [options]");
+  console.error("Options:");
+  console.error("  --relay, -r <url>       Relay URL (repeatable)");
+  console.error("  --connect-uri, -c <uri> Upstream wallet connect URI");
+  console.error("  --data, -d <path>       Working directory for storage");
+  console.error("  --config, -f <path>     JSON config file");
+  console.error("  --create <label>        Create a sub-account and print connect URI");
+  console.error("  --description <text>    Optional description for new sub-account");
+  console.error("  --client-secret <hex>   Optional client secret override (64 hex chars)");
+  console.error("  --service-secret <hex>  Optional service secret override (64 hex chars)");
+  console.error("  --list                  List configured sub-accounts and exit");
+}
+
+function ensureDataDirectory(path: string): void {
+  if (!existsSync(path)) {
+    mkdirSync(path, { recursive: true });
   }
 }
 
-// Parse CLI arguments
-const { values } = parseArgs({
+function printSubAccounts(dbRelays: string[]): void {
+  const accounts = getSubAccounts();
+  if (accounts.length === 0) {
+    console.log("No sub-accounts stored yet.");
+    return;
+  }
+  console.log(`Found ${accounts.length} sub-accounts:\n`);
+  for (const account of accounts) {
+    const secrets = getSubAccountSecrets(account.id);
+    const relays = account.relays.length ? account.relays : dbRelays;
+    const uri = createWalletConnectURI({
+      service: account.servicePubkey,
+      relays,
+      secret: secrets.clientSecret,
+    });
+    console.log(`- ${account.label}`);
+    console.log(`  id: ${account.id}`);
+    console.log(`  client pubkey: ${account.clientPubkey}`);
+    console.log(`  service pubkey: ${account.servicePubkey}`);
+    console.log(`  balance: ${account.balanceMsats} msats`);
+    console.log(`  pending: ${account.pendingMsats} msats`);
+    if (account.lastUsedAt) console.log(`  last used: ${account.lastUsedAt}`);
+    console.log(`  relays: ${relays.join(", ")}`);
+    console.log(`  connect uri: ${uri}`);
+    console.log("");
+  }
+}
+
+function printCreateResult(result: CreateSubAccountResult): void {
+  console.log("Created sub-account:\n");
+  console.log(`Label:       ${result.record.label}`);
+  console.log(`ID:          ${result.record.id}`);
+  console.log(`Client npub: ${result.record.clientPubkey}`);
+  console.log(`Service npub:${result.record.servicePubkey}`);
+  console.log(`Client secret (keep safe): ${result.clientSecret}`);
+  console.log(`Connect URI: ${result.connectURI}`);
+  console.log("");
+  console.log("Share the Connect URI (or client secret) securely with the client.");
+}
+
+const parsed = parseArgs({
   args: Bun.argv.slice(2),
   options: {
-    relay: {
-      type: "string",
-      short: "r",
-      multiple: true,
-    },
-    "connect-uri": {
-      type: "string",
-      short: "c",
-    },
-    data: {
-      type: "string",
-      short: "b",
-    },
-    config: {
-      type: "string",
-      short: "f",
-    },
+    relay: { type: "string", short: "r", multiple: true },
+    "connect-uri": { type: "string", short: "c" },
+    data: { type: "string", short: "d" },
+    config: { type: "string", short: "f" },
+    create: { type: "string" },
+    description: { type: "string" },
+    "client-secret": { type: "string" },
+    "service-secret": { type: "string" },
+    list: { type: "boolean" },
   },
   strict: true,
   allowPositionals: false,
 });
 
-// Load custom config file if specified
+const values = parsed.values as CliValues;
+
+let config: Config = {};
+if (existsSync("config.json")) {
+  try {
+    config = loadConfig("config.json");
+    console.log("Loaded configuration from config.json");
+  } catch (error) {
+    console.warn("Failed to parse config.json", error);
+  }
+}
+
 if (values.config) {
   try {
-    const configData = readFileSync(values.config, "utf-8");
-    config = JSON.parse(configData);
+    config = loadConfig(values.config);
     console.log(`Loaded configuration from ${values.config}`);
   } catch (error) {
-    console.error(`Error loading config file: ${error}`);
+    console.error(`Unable to parse ${values.config}:`, error);
     process.exit(1);
   }
 }
 
-// Merge CLI arguments with config (CLI takes precedence)
-const relayFromConfig = Array.isArray(config.relay)
-  ? config.relay
-  : config.relay
-  ? [config.relay]
-  : undefined;
-const finalRelays = values.relay || relayFromConfig;
-const finalConnectUri = values["connect-uri"] || config["connect-uri"];
-const finalDataPath = values.data || config.data;
+const relays = values.relay || coerceRelays(config.relay);
+const connectUri = values["connect-uri"] || config["connect-uri"];
+const dataPath = values.data || config.data || join(process.cwd(), "data");
 
-if (!finalRelays || !finalConnectUri || !finalDataPath) {
-  console.error("Usage: bun run index.ts [options]");
-  console.error("Options:");
-  console.error(
-    "  --relay, -r: Relay URL to listen on (can be specified multiple times)"
-  );
-  console.error("  --connect-uri, -c: Upstream wallet connect URI");
-  console.error("  --data, -d: Path to folder containing client data");
-  console.error("  --config, -f: Path to config file (default: config.json)");
-  console.error("");
-  console.error("Configuration can also be provided via config.json file:");
-  console.error(`{
-  "relay": ["wss://relay1.com", "wss://relay2.com"],
-  "connect-uri": "nostr+walletconnect://...",
-  "data": "./data"
-}`);
-  console.error("");
-  console.error("CLI arguments take precedence over config file values.");
+if (!relays || !relays.length || !connectUri) {
+  printUsage();
   process.exit(1);
 }
 
-const relays = Array.isArray(finalRelays) ? finalRelays : [finalRelays];
-const connectUri = finalConnectUri;
-const dataPath = finalDataPath;
+ensureDataDirectory(dataPath);
+const dbPath = join(dataPath, "subwallets.db");
+initStorage({ dbPath });
 
-// Make sure data path exists
-if (!existsSync(dataPath)) {
-  console.log(`Creating new data folder at ${dataPath}`);
-  mkdirSync(dataPath, { recursive: true });
+if (values.list) {
+  printSubAccounts(relays);
+  process.exit(0);
 }
 
-const balancesPath = join(dataPath, "balances.json");
-const pendingPath = join(dataPath, "pending.json");
-
-// Load or create balances file
-let balances: Record<string, number> = {};
-if (existsSync(balancesPath)) {
-  try {
-    const data = readFileSync(balancesPath, "utf-8");
-    balances = JSON.parse(data);
-    console.log(`Loaded balances for ${Object.keys(balances).length} clients`);
-  } catch (error) {
-    console.error(`Error loading balances file: ${error}`);
-    process.exit(1);
-  }
-} else {
-  console.log(`Creating new balances file at ${balancesPath}`);
-  writeFileSync(balancesPath, JSON.stringify(balances, null, 2));
-}
-
-// Function to save balances
-function saveBalances() {
-  try {
-    writeFileSync(balancesPath, JSON.stringify(balances, null, 2));
-  } catch (error) {
-    console.error(`Error saving balances: ${error}`);
-  }
-}
-
-// Load or create balances file
-let pending: (Transaction & { owner: string })[] = [];
-if (existsSync(pendingPath)) {
-  try {
-    const data = readFileSync(pendingPath, "utf-8");
-    pending = JSON.parse(data);
-    console.log(`Loaded pending for ${pending.length} clients`);
-  } catch (error) {
-    console.error(`Error loading pending file: ${error}`);
-    process.exit(1);
-  }
-} else {
-  console.log(`Creating new pending file at ${pendingPath}`);
-  writeFileSync(pendingPath, JSON.stringify(pending, null, 2));
-}
-
-/** Save pending invoices */
-function savePending() {
-  try {
-    writeFileSync(pendingPath, JSON.stringify(pending, null, 2));
-  } catch (error) {
-    console.error(`Error saving pending: ${error}`);
-  }
-}
-
-/** Remove expired pending invoices */
-function prunePending() {
-  const now = Date.now();
-  pending = pending.filter((p) => p.expires_at && p.expires_at > now);
-  savePending();
-}
-
-// Set up relay pool
 const pool = new RelayPool();
-
-// Set default pool for wallet connect and service
 WalletConnect.pool = pool;
 
-// Connect to upstream wallet
 console.log(`Connecting to upstream wallet: ${connectUri}`);
 const upstream = await WalletConnect.fromConnectURI(connectUri);
-
-// Wait for upstream service to connect
 await upstream.waitForService();
 console.log("Connected to upstream wallet service");
 
-// Create a signer for all the downstream services
-const signer = SimpleSigner.fromKey(upstream.secret);
+const manager = new WalletServiceManager({ relays, pool, upstream });
 
-// Map to track active wallet services per client
-const clientServices = new Map<string, WalletService>();
-
-// Check for paid invoices
-if (await upstream.supportsNotifications()) {
-  upstream.notification("payment_received", (notification) => {
-    if (notification.type !== "incoming") return;
-
-    console.log("Payment received:", notification);
-
-    // Find existing pending transaction by invoice or payment hash
-    const existing = pending.find(
-      (p) =>
-        (p.payment_hash &&
-          notification.payment_hash &&
-          p.payment_hash === notification.payment_hash) ||
-        (p.invoice &&
-          notification.invoice &&
-          p.invoice === notification.invoice) ||
-        (p.description_hash &&
-          notification.description_hash &&
-          p.description_hash === notification.description_hash)
-    );
-
-    if (existing) {
-      console.log("Updating balance for client:", existing.owner);
-
-      // Update user balance
-      balances[existing.owner] =
-        (balances[existing.owner] || 0) + existing.amount;
-      saveBalances();
-
-      // Forward notification to client
-      const client = clientServices.get(existing.owner);
-      if (client) client.notify("payment_received", notification);
-
-      // Removing pending transaction
-      pending = pending.filter((p) => p !== existing);
-      savePending();
-    }
-  });
-} else {
-  // Let downstream wallets check for their own invoices
-}
-
-// Create single relay subscription for all clients
-const subscription = pool
-  .subscription(
+if (values.create) {
+  const result = await manager.createSubAccount({
+    label: values.create,
+    description: values.description,
     relays,
-    { kinds: [WALLET_REQUEST_KIND], "#p": [await signer.getPublicKey()] },
-    { reconnect: true }
-  )
-  .pipe(
-    onlyEvents(),
-    tap((e) => {
-      if (clientServices.has(e.pubkey)) return;
-
-      // Create a new wallet service for the client
-      createWalletService(e.pubkey);
-    }),
-    // Only create a single subscription
-    share()
-  );
-
-// Listen for new connections
-subscription.subscribe();
-
-// Function to create a wallet service for a client
-async function createWalletService(
-  clientPubkey: string
-): Promise<WalletService> {
-  // Initialize balance if it doesn't exist
-  if (!(clientPubkey in balances)) {
-    balances[clientPubkey] = 0;
-    saveBalances();
-    console.log(`Initialized balance for new client: ${clientPubkey}`);
-  }
-
-  const service = new WalletService({
-    relays: relays,
-    signer: signer,
-    client: clientPubkey,
-    // Pass the single subscription to the service
-    subscriptionMethod: () => subscription,
-    // Pass the single pool to the service
-    publishMethod: (relays, event) => pool.publish(relays, event),
-    // Set up handlers for wallet methods
-    handlers: {
-      get_balance: async () => {
-        const clientBalance = balances[clientPubkey] || 0;
-        return { balance: clientBalance };
-      },
-      get_info: async () => {
-        return await upstream.getInfo();
-      },
-      pay_invoice: async (params) => {
-        const clientBalance = balances[clientPubkey] || 0;
-        const amount = params.amount || 0;
-
-        if (amount > clientBalance) throw new Error("Insufficient balance");
-
-        // Forward to upstream wallet
-        const result = await upstream.payInvoice(params.invoice, params.amount);
-
-        // Deduct from client balance
-        balances[clientPubkey] = clientBalance - amount;
-        saveBalances();
-
-        return result;
-      },
-      make_invoice: async (params) => {
-        // Forward to upstream wallet
-        const transaction = await upstream.makeInvoice(params.amount, params);
-        console.log(
-          "Created invoice for client:",
-          clientPubkey,
-          transaction.payment_hash || transaction.invoice
-        );
-
-        // Add to pending
-        pending.push({ ...transaction, owner: clientPubkey });
-        savePending();
-
-        return transaction;
-      },
-      lookup_invoice: async (params) => {
-        console.log(
-          "Looking up invoice:",
-          params.payment_hash || params.invoice
-        );
-
-        // Forward to upstream wallet
-        const check = await upstream.lookupInvoice(
-          params.payment_hash,
-          params.invoice
-        );
-
-        if (check.state === "settled") {
-          // Find existing pending transaction by invoice or payment hash
-          const existing = pending.find(
-            (p) =>
-              (p.payment_hash &&
-                check.payment_hash &&
-                p.payment_hash === check.payment_hash) ||
-              (p.invoice && check.invoice && p.invoice === check.invoice) ||
-              (p.description_hash &&
-                check.description_hash &&
-                p.description_hash === check.description_hash)
-          );
-
-          if (existing?.state === "pending") {
-            console.log(
-              "Invoice was paid, updating balance for client:",
-              existing.owner
-            );
-
-            // Invoice was paid, update balance
-            balances[existing.owner] =
-              (balances[existing.owner] || 0) + existing.amount;
-            saveBalances();
-
-            // Removing pending transaction
-            pending = pending.filter((p) => p !== existing);
-            savePending();
-          }
-        }
-
-        return check;
-      },
-    },
-    notifications: ["payment_received"],
+    clientSecretHex: values["client-secret"],
+    serviceSecretHex: values["service-secret"],
   });
-
-  // Save to cache
-  clientServices.set(clientPubkey, service);
-
-  await service.start();
-  console.log(`Wallet service started for client: ${clientPubkey}`);
-
-  return service;
+  printCreateResult(result);
+  await manager.stop();
+  process.exit(0);
 }
 
-// Recreate services for all existing balances on startup
-console.log("Recreating services for existing balances...");
-for (const clientPubkey of Object.keys(balances)) {
-  try {
-    await createWalletService(clientPubkey);
-  } catch (error) {
-    console.error(
-      `Failed to recreate service for client ${clientPubkey}:`,
-      error
-    );
-  }
-}
-
-// Prune expired pending invoices
-prunePending();
+await manager.start();
 
 console.log("NWC One-to-Many service is running...");
-console.log(`Listening on relays: ${relays.join(", ")}`);
-console.log(`Balances file: ${balancesPath}`);
+console.log(`Relays: ${relays.join(", ")}`);
+console.log(`Database: ${dbPath}`);
 console.log("");
-console.log("Use the following scripts to create a new account:");
-console.log("\n1. Generate a secret key");
-console.log("SECRET=$(nak key generate)");
-console.log("\n2. Create the account");
-console.log(
-  `nak event -k 23194 --sec $SECRET -p=${await signer.getPublicKey()} ${relays.join(
-    " "
-  )}`
-);
-console.log("\n3. Create the connect URI");
-console.log(
-  `echo "${createWalletConnectURI({
-    service: await signer.getPublicKey(),
-    relays: relays,
-    secret: "SECRET",
-  }).replace("SECRET", "$SECRET")}"`
-);
+console.log("Existing sub-accounts:");
+printSubAccounts(relays);
+console.log("");
+console.log("Use --create <label> to create a new connect code.");
 
-// Graceful shutdown
 process.on("SIGINT", () => {
   console.log("\nShutting down...");
-
-  // Stop all client services
-  for (const [clientPubkey, service] of clientServices) {
-    console.log(`Stopping service for client: ${clientPubkey}`);
-    service.stop();
-  }
-
-  process.exit(0);
+  manager
+    .stop()
+    .catch((error) => console.error("Error during shutdown", error))
+    .finally(() => {
+      try {
+        (upstream as any)?.stop?.();
+      } catch (error) {
+        console.warn("Failed to stop upstream cleanly", error);
+      }
+      process.exit(0);
+    });
 });

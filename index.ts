@@ -60,6 +60,121 @@ function resolveInvoiceAmountMsats(invoice: string): number {
   throw new Error("Invoice does not contain a fixed amount");
 }
 
+async function payLnAddressViaClientFlow(
+  wallet: WalletConnect,
+  store: NwcStore,
+  entry: NwcEntry,
+  nickname: string,
+  activeSubAccountId: string | null
+): Promise<void> {
+  const {
+    parseLightningAddress,
+    fetchLnurlpParams,
+    requestInvoice,
+    verifyInvoiceAmount,
+    verifyInvoiceDescriptionHashIfAvailable,
+  } = await import("./utils/lnurl");
+
+  const lnaddr = await prompt("LN Address (name@domain):");
+  if (!lnaddr) {
+    println("No LN address provided.");
+    return;
+  }
+
+  const url = parseLightningAddress(lnaddr.trim());
+  if (!url) {
+    println("Invalid LN address.");
+    return;
+  }
+
+  const domain = url.hostname;
+  const params = await withTimeout(fetchLnurlpParams(url), 20000, "lnurlp_fetch");
+  if (params.tag !== "payRequest") {
+    println("Not a payRequest LNURL.");
+    return;
+  }
+
+  println(`LNURL domain: ${domain}`);
+  try {
+    const metadata = JSON.parse(params.metadata);
+    const textEntry = Array.isArray(metadata)
+      ? metadata.find((e: any) => Array.isArray(e) && e[0] === "text/plain")
+      : undefined;
+    if (textEntry?.[1]) println(`Description: ${textEntry[1]}`);
+  } catch {}
+
+  const minSats = Math.ceil(params.minSendable / MSATS_PER_SAT);
+  const maxSats = Math.floor(params.maxSendable / MSATS_PER_SAT);
+  println(`Amount range: ${minSats} - ${maxSats} sats`);
+  const sats = await promptNumber("Amount (sats):");
+  if (sats < minSats || sats > maxSats) {
+    println("Amount out of bounds.");
+    return;
+  }
+
+  let comment: string | undefined;
+  if ((params.commentAllowed || 0) > 0) {
+    const c = await prompt(`Comment (up to ${params.commentAllowed} chars, optional):`);
+    comment = (c || "").slice(0, params.commentAllowed);
+  }
+
+  const msats = sats * MSATS_PER_SAT;
+  if (activeSubAccountId) {
+    const sub = requireSubAccount(entry, nickname, activeSubAccountId);
+    if (!sub) return;
+    if (!hasSufficientBalance(entry, activeSubAccountId, msats)) {
+      println(
+        `Insufficient balance. ${sub.label} has ${formatMsats(sub.balanceMsats)}, requires ${formatMsats(msats)}.`
+      );
+      return;
+    }
+  }
+
+  const cbResp = await withTimeout(
+    requestInvoice(params.callback, msats, { comment }),
+    20000,
+    "lnurlp_callback"
+  );
+  const pr = cbResp.pr;
+
+  verifyInvoiceAmount(pr, msats);
+  verifyInvoiceDescriptionHashIfAvailable(pr, params.metadata);
+
+  const payRes: PayInvoiceResult = await withTimeout(
+    wallet.payInvoice(pr),
+    PAY_TIMEOUT_MS,
+    "pay_invoice"
+  );
+  println("Payment submitted:");
+  println(JSON.stringify(payRes, null, 2));
+
+  if (cbResp.successAction) {
+    const sa = cbResp.successAction;
+    if (sa.tag === "message" && sa.message) {
+      println(`Success message: ${sa.message}`);
+    } else if (sa.tag === "url" && sa.url) {
+      println(`Success URL: ${sa.url}${sa.description ? ` - ${sa.description}` : ""}`);
+    } else if (sa.tag === "aes") {
+      println("Success AES payload received (decryption not implemented in CLI).");
+    }
+  }
+
+  if (activeSubAccountId) {
+    try {
+      debitSubAccount(entry, activeSubAccountId, msats);
+      recordSubAccountUsage(store, nickname, activeSubAccountId, { immediateSave: false });
+      saveNwcStore(store);
+      println(
+        `[ledger] Debited ${formatMsats(msats)} from ${describeContext(entry, nickname, activeSubAccountId)}.`
+      );
+    } catch (err: any) {
+      println(`[ledger] Failed to debit sub-account: ${err?.message || String(err)}`);
+    }
+  } else {
+    recordSubAccountUsage(store, nickname, activeSubAccountId);
+  }
+}
+
 function requireSubAccount(entry: NwcEntry, nickname: string, subId: string | null): NwcSubAccount | null {
   if (!subId) return null;
   const sub = getSubAccount(entry, subId);
@@ -458,7 +573,9 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
     if (supportsMethod(support, "pay_invoice")) menuItems.push({ value: "pay_invoice", label: "Pay invoice" });
     if (supportsMethod(support, "list_transactions")) menuItems.push({ value: "list_transactions", label: "List transactions" });
     if (supportsMethod(support, "lookup_invoice")) menuItems.push({ value: "lookup_invoice", label: "Lookup invoice" });
-    if (supportsMethod(support, "pay_lnaddress")) menuItems.push({ value: "pay_lnaddress", label: "Pay LN Address" });
+    if (supportsMethod(support, "pay_lnaddress" as any)) {
+      menuItems.push({ value: "pay_lnaddress", label: "Pay LN Address" });
+    }
     menuItems.push({ value: "pay_lnaddress_client", label: "Pay LN Address (client)" });
 
     const hasSubAccounts = Object.keys(entry.subAccounts || {}).length > 0;
@@ -625,116 +742,35 @@ async function showMenu({ wallet, support, store, nickname }: ShowMenuContext) {
           break;
         }
         case "pay_lnaddress": {
+          if (activeSubAccountId) {
+            await payLnAddressViaClientFlow(wallet, store, entry, nickname, activeSubAccountId);
+            break;
+          }
+
           const lnaddr = await prompt("LN Address (name@domain):");
           if (!lnaddr) {
             println("No LN address provided.");
             break;
           }
-          if (!(supportsMethod(support, "pay_lnaddress") && (wallet as any).payLnAddress)) {
+
+          if (!(supportsMethod(support, "pay_lnaddress" as any) && (wallet as any).payLnAddress)) {
             println("pay_lnaddress not supported by this wallet.");
             break;
           }
+
           const amount = await promptNumber("Amount (sats):");
           const amountMsats = amount * MSATS_PER_SAT;
-          if (activeSubAccountId) {
-            const sub = requireSubAccount(entry, nickname, activeSubAccountId);
-            if (!sub) break;
-            if (!hasSufficientBalance(entry, activeSubAccountId, amountMsats)) {
-              println(`Insufficient balance. ${sub.label} has ${formatMsats(sub.balanceMsats)}, requires ${formatMsats(amountMsats)}.`);
-              break;
-            }
-          }
-          const result = await withTimeout((wallet as any).payLnAddress(lnaddr.trim(), amount * 1000), PAY_TIMEOUT_MS, "pay_lnaddress");
+          const result = await withTimeout(
+            (wallet as any).payLnAddress(lnaddr.trim(), amountMsats),
+            PAY_TIMEOUT_MS,
+            "pay_lnaddress"
+          );
           println(JSON.stringify(result, null, 2));
-          if (activeSubAccountId) {
-            try {
-              debitSubAccount(entry, activeSubAccountId, amountMsats);
-              recordSubAccountUsage(store, nickname, activeSubAccountId, { immediateSave: false });
-              saveNwcStore(store);
-              println(`[ledger] Debited ${formatMsats(amountMsats)} from ${describeContext(entry, nickname, activeSubAccountId)}.`);
-            } catch (err: any) {
-              println(`[ledger] Failed to debit sub-account: ${err?.message || String(err)}`);
-            }
-          } else {
-            recordSubAccountUsage(store, nickname, activeSubAccountId);
-          }
+          recordSubAccountUsage(store, nickname, activeSubAccountId);
           break;
         }
         case "pay_lnaddress_client": {
-          const { parseLightningAddress, fetchLnurlpParams, requestInvoice, verifyInvoiceAmount, verifyInvoiceDescriptionHashIfAvailable } = await import("./utils/lnurl.ts");
-          const lnaddr = await prompt("LN Address (name@domain):");
-          if (!lnaddr) { println("No LN address provided."); break; }
-
-          const url = parseLightningAddress(lnaddr.trim());
-          if (!url) { println("Invalid LN address."); break; }
-          const domain = url.hostname;
-
-          const params = await withTimeout(fetchLnurlpParams(url), 20000, "lnurlp_fetch");
-          if (params.tag !== "payRequest") { println("Not a payRequest LNURL."); break; }
-
-          println(`LNURL domain: ${domain}`);
-          try {
-            const metadata = JSON.parse(params.metadata);
-            const textEntry = Array.isArray(metadata) ? metadata.find((e: any) => Array.isArray(e) && e[0] === "text/plain") : undefined;
-            if (textEntry?.[1]) println(`Description: ${textEntry[1]}`);
-          } catch {}
-
-          const minSats = Math.ceil(params.minSendable / 1000);
-          const maxSats = Math.floor(params.maxSendable / 1000);
-          println(`Amount range: ${minSats} - ${maxSats} sats`);
-          let sats = await promptNumber("Amount (sats):");
-          if (sats < minSats || sats > maxSats) {
-            println("Amount out of bounds.");
-            break;
-          }
-
-          let comment: string | undefined = undefined;
-          if ((params.commentAllowed || 0) > 0) {
-            const c = await prompt(`Comment (up to ${params.commentAllowed} chars, optional):`);
-            comment = (c || "").slice(0, params.commentAllowed);
-          }
-
-          const msats = sats * 1000;
-          if (activeSubAccountId) {
-            const sub = requireSubAccount(entry, nickname, activeSubAccountId);
-            if (!sub) break;
-            if (!hasSufficientBalance(entry, activeSubAccountId, msats)) {
-              println(`Insufficient balance. ${sub.label} has ${formatMsats(sub.balanceMsats)}, requires ${formatMsats(msats)}.`);
-              break;
-            }
-          }
-          const cbResp = await withTimeout(requestInvoice(params.callback, msats, { comment }), 20000, "lnurlp_callback");
-          const pr = cbResp.pr;
-
-          verifyInvoiceAmount(pr, msats);
-          verifyInvoiceDescriptionHashIfAvailable(pr, params.metadata);
-
-          const payRes: PayInvoiceResult = await withTimeout(wallet.payInvoice(pr), PAY_TIMEOUT_MS, "pay_invoice");
-          println("Payment submitted:");
-          println(JSON.stringify(payRes, null, 2));
-
-          if (cbResp.successAction) {
-            const sa = cbResp.successAction;
-            if (sa.tag === "message" && sa.message) {
-              println(`Success message: ${sa.message}`);
-            } else if (sa.tag === "url" && sa.url) {
-              println(`Success URL: ${sa.url}${sa.description ? ` - ${sa.description}` : ""}`);
-            } else if (sa.tag === "aes") {
-              println("Success AES payload received (decryption not implemented in CLI).");
-            }
-          }
-          if (activeSubAccountId) {
-            try {
-              debitSubAccount(entry, activeSubAccountId, msats);
-              recordSubAccountUsage(store, nickname, activeSubAccountId, { immediateSave: false });
-              saveNwcStore(store);
-              println(`[ledger] Debited ${formatMsats(msats)} from ${describeContext(entry, nickname, activeSubAccountId)}.`);
-            } catch (err: any) {
-              println(`[ledger] Failed to debit sub-account: ${err?.message || String(err)}`);
-            }
-          } else {
-            recordSubAccountUsage(store, nickname, activeSubAccountId);
-          }
+          await payLnAddressViaClientFlow(wallet, store, entry, nickname, activeSubAccountId);
           break;
         }
         default:
@@ -753,7 +789,7 @@ async function main() {
   // Set START_API=0 to disable.
   try {
     if (process.env.START_API !== "0") {
-      await import("./api.ts");
+      await import("./api");
     }
   } catch (e) {
     // Non-fatal: continue running CLI even if API fails to start
