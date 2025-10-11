@@ -11,6 +11,7 @@ export interface NwcSubAccount {
   updatedAt: string;
   lastUsedAt?: string;
   usageCount?: number;
+  connectUri?: string;
   metadata?: Record<string, unknown>;
   balanceMsats?: number;
   pendingMsats?: number;
@@ -49,6 +50,10 @@ function normalizeSubAccounts(value: unknown): Record<string, NwcSubAccount> {
     const sub = rawVal as Partial<NwcSubAccount>;
     if (typeof sub.id !== "string" || !sub.id) continue;
     const now = new Date().toISOString();
+    let connectUri: string | undefined;
+    if (typeof sub.connectUri === "string" && sub.connectUri.trim()) {
+      connectUri = sub.connectUri.trim();
+    }
     const normalized: NwcSubAccount = {
       id: sub.id,
       label: typeof sub.label === "string" && sub.label.trim() ? sub.label.trim() : sub.id,
@@ -57,6 +62,7 @@ function normalizeSubAccounts(value: unknown): Record<string, NwcSubAccount> {
       updatedAt: typeof sub.updatedAt === "string" ? sub.updatedAt : typeof sub.createdAt === "string" ? sub.createdAt : now,
       lastUsedAt: typeof sub.lastUsedAt === "string" ? sub.lastUsedAt : undefined,
       usageCount: typeof sub.usageCount === "number" && Number.isFinite(sub.usageCount) ? Math.max(0, Math.floor(sub.usageCount)) : 0,
+      connectUri,
       metadata: sub.metadata && typeof sub.metadata === "object" ? (sub.metadata as Record<string, unknown>) : undefined,
       balanceMsats: normalizeMsat(sub.balanceMsats),
       pendingMsats: normalizeMsat(sub.pendingMsats),
@@ -144,6 +150,9 @@ export function saveNwcStore(store: NwcStore): void {
           if (sub) {
             prepareSubAccount(sub);
             const serialized: NwcSubAccount = { ...sub };
+            if (serialized.connectUri && !serialized.connectUri.trim()) {
+              delete serialized.connectUri;
+            }
             if (sub.invoices) {
               serialized.invoices = Object.keys(sub.invoices)
                 .sort((a, b) => a.localeCompare(b))
@@ -184,6 +193,40 @@ export function generateSubAccountId(store: NwcStore, nickname: string): string 
     if (!existing.has(id)) return id;
   }
   return `${Date.now().toString(16)}${randomBytes(2).toString("hex")}`;
+}
+
+export interface CreateSubAccountInput {
+  label: string;
+  description?: string;
+  connectUri?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export function createSubAccountRecord(
+  store: NwcStore,
+  nickname: string,
+  input: CreateSubAccountInput
+): { id: string; sub: NwcSubAccount } {
+  const entry = store[nickname];
+  if (!entry) throw new Error(`Wallet '${nickname}' not found`);
+  ensureSubAccountContainer(entry);
+  const id = generateSubAccountId(store, nickname);
+  const now = new Date().toISOString();
+  const sub: NwcSubAccount = {
+    id,
+    label: input.label.trim() || id,
+    description: input.description?.trim() || undefined,
+    createdAt: now,
+    updatedAt: now,
+    usageCount: 0,
+    connectUri: input.connectUri?.trim() || undefined,
+    metadata: input.metadata,
+    balanceMsats: 0,
+    pendingMsats: 0,
+    invoices: {},
+  };
+  entry.subAccounts![id] = sub;
+  return { id, sub };
 }
 
 export interface WalletResolution {
@@ -263,6 +306,10 @@ function prepareSubAccount(sub: NwcSubAccount): void {
   if (typeof sub.balanceMsats !== "number" || !Number.isFinite(sub.balanceMsats)) sub.balanceMsats = 0;
   if (typeof sub.pendingMsats !== "number" || !Number.isFinite(sub.pendingMsats)) sub.pendingMsats = 0;
   if (!sub.invoices) sub.invoices = {};
+  if (typeof sub.connectUri === "string") {
+    const trimmed = sub.connectUri.trim();
+    sub.connectUri = trimmed.length ? trimmed : undefined;
+  }
 }
 
 export function hasSufficientBalance(entry: NwcEntry, subAccountId: string, amountMsats: number): boolean {
